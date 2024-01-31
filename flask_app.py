@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_from_directory
 
 import board_reader_utility as u
 import board_reader as board_reader
@@ -14,6 +14,12 @@ app = Flask(__name__, template_folder='templates')
 def home():
     data = {}
     return render_template('index.html', data=data)
+
+@app.get('/test-image/<path:path>')
+def send_image(path):
+    return send_from_directory(
+        directory='tests/test_images/', path=path
+    )
 
 @app.route("/read-image/", methods=['POST'])
 def read_image():
