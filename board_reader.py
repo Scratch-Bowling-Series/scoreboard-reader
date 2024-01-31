@@ -1,4 +1,6 @@
 import os
+import random
+import re
 import sys
 
 import cv2 as cv
@@ -201,9 +203,9 @@ class BoardDetection:
                     board_image_height, board_image_width, board_image_area = u.image_shape(board.image)
 
                     # Use line detection to rectify any remaining distortion
-                    lines = u.detect_lines_from_image(board.image)
-                    rotation_matrix = u.rotation_matrix_from_lines(lines, (board_image_width, board_image_height))
-                    board.image = cv.warpAffine(board.image, rotation_matrix, (board_image_height, board_image_width))
+                    #lines = u.detect_lines_from_image(board.image)
+                    #rotation_matrix = u.rotation_matrix_from_lines(lines, (board_image_width, board_image_height))
+                    #board.image = cv.warpAffine(board.image, rotation_matrix, (board_image_height, board_image_width))
 
                     # Add a black margin to the image
                     board.image = u.add_margin_to_image(board.image, 5, u.COLOR_BLACK)
@@ -363,7 +365,7 @@ class BoardRecognition:
         board.recognition_rows = recognition_rows
         board.recognition_lane = lane_text
 
-        board.times['recognition'] = timer.stop()
+        board.times['recognition_inference'] = timer.stop()
 
     def read_roi(self, image, allow_list, text_threshold=0.5):
         text = ''
@@ -396,7 +398,13 @@ class BoardPostProcess:
         
 
     def post_process(self, board):
-        
+        # Start Timer
+        timer = u.start_timer()
+
+        board.bowler_names = []
+        board.bowler_frames = []
+        board.bowler_totals = []
+
         for row in board.recognition_rows:
             name, frames, total = row
             
@@ -405,48 +413,93 @@ class BoardPostProcess:
             total = self.post_process__total(total)
             
             for frame_index, frame in enumerate(frames):
-                first, second, total = frame
-        
-                if total:
-                    board.active_bowler_index = frame_index
-                
+                if len(frame) > 0 and frame[len(frame)-1]:
+                    board.current_frame = frame_index
+
             board.bowler_names.append(name)
             board.bowler_frames.append(frames)
             board.bowler_totals.append(total)
-        
+
         board.bowler_count = len(board.bowler_names)
+        board.active_bowler_index = board.bowler_count - 1
         board.lane_number = self.post_process__lane_number(board.recognition_lane)
+
+        board.times['recognition_post_process'] = timer.stop()
 
     def post_process__frames(self, frames):
         processed_frames = []
+        frame_pattern = re.compile(r"(X|\/|\-|\||\d+)")
 
         for frame_index, frame in enumerate(frames):
-            # frame is a string of the raw recognized frame data
-            # this string may or may not be space separated
-            # this string sometimes could be completely inaccurate or empty
-            # we need to split this string into first second and total intelligently
-            # we can do this using prev processed frames and future unprocessed frames
-            # while also using knowledge of how a bowling frame is structured and its restrictions based on many factors
-            # with this i hope to post process the jambled string of ocr recognized text for each frame and predively and inteligently build this consistent list structure
-            # please complete the implementation below, i have already built a tiny bit out to give you an idea
 
-            first = '' # 0-9 / - X
-            second = ''# 0-9 / - X
-            total = '' # 0-9
+            # Find all parts of the frame using regex
+            parts = frame_pattern.findall(frame)
 
-            prev_processed_frame = None
-            if len(processed_frames) > 0:
-                prev_processed_frame = processed_frames[frame_index - 1]
-
-            if prev_processed_frame:
-                pass # post process help from prev frame if exists
+            if len(parts) == 1:
+                # Single part - could be a strike, a total after a spare, or the first throw
+                part = parts[0]
+                first, second, third, total = self.process_single_part_frame(part, frame_index, processed_frames)
+            elif len(parts) == 2:
+                # Two parts - could be first and second throws, or a throw and total score
+                first, second, third, total = self.process_two_part_frame(parts, frame_index, processed_frames)
+            elif len(parts) == 3:
+                # Two parts - could be first and second throws, or a throw and total score
+                first, second, third, total = self.process_three_part_frame(parts, frame_index, processed_frames)
+            elif len(parts) == 4:
+                # Three parts - likely first throw, second throw, and total score
+                first, second, third, total = parts
             else:
-                pass # we know we are at the first frame, include processing steps that are first frame specific
+                # Handle frames with more than three parts or other anomalies
+                first, second, third, total = self.handle_anomalous_frame(parts, frame_index, processed_frames)
 
+            if frame_index == 9:
+                processed_frame = [first, second, third, total]
+            else:
+                processed_frame = [first, second, total]
 
-            processed_frames.append([first,second,total])
+            processed_frames.append(processed_frame)
 
         return processed_frames
+
+    def process_single_part_frame(self, part, frame_index, processed_frames):
+        first = second = third = total = 0
+        # Implement logic for frames with a single part
+        # Analyze previous frames, apply bowling rules, and make predictions
+        # Return first, second, and total
+        total = part
+
+        return first, second, third, total
+
+    def process_two_part_frame(self, parts, frame_index, processed_frames):
+        first = second = third = total = 0
+        # Implement logic for frames with two parts
+        # Analyze previous frames, apply bowling rules, and make predictions
+        # Return first, second, and total
+        first = parts[0]
+        total = parts[1]
+
+        return first, second, third, total
+
+    def process_three_part_frame(self, parts, frame_index, processed_frames):
+        first = second = third = total = 0
+        # Implement logic for frames with two parts
+        # Analyze previous frames, apply bowling rules, and make predictions
+        # Return first, second, and total
+        first = parts[0]
+        second = parts[1]
+        total = parts[2]
+
+        return first, second, third, total
+
+    def handle_anomalous_frame(self, parts, frame_index, processed_frames):
+        first = second = third = total = 0
+        # Implement logic for handling frames that don't fit the usual patterns
+        # This might involve complex predictions and handling a wide variety of edge cases
+        # Return first, second, and total
+        total = parts
+
+        return first, second, third, total
+
 
     def post_process__name(self, name):
        return name
