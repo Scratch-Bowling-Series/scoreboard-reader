@@ -7,10 +7,13 @@ import cv2 as cv
 import numpy as np
 import torch
 from easyocr import easyocr
+from pytesseract import pytesseract
 from ultralytics import YOLO
 torch.device("cpu")
 import board_reader_utility as u
 
+
+pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 directory = os.path.dirname(__file__)
 DETECTION_MODEL_DEFAULT = os.path.join(directory, 'weights/detection/best.pt')
 SEGMENTATION_MODEL_DEFAULT = os.path.join(directory, 'weights/segmentation/best.pt')
@@ -20,15 +23,15 @@ RECOGNITION_MODEL_DEFAULT = os.path.join(directory, 'weights/recognition/best.pt
 ##--------------------------------
 ## Methods
 ##--------------------------------
-def read_image(image, single_board=True, detection_model=DETECTION_MODEL_DEFAULT,segmentation_model=SEGMENTATION_MODEL_DEFAULT,recognition_model=RECOGNITION_MODEL_DEFAULT):
+def read_image(image, single_board=True, detection_model=DETECTION_MODEL_DEFAULT,segmentation_model=SEGMENTATION_MODEL_DEFAULT,recognition_model=RECOGNITION_MODEL_DEFAULT, gpu=False):
     try:
         # Check if the image provided is valid
         if not u.image_valid(image):
             raise ImageInvalid('The image provided is invalid')
 
         # Initialize the classes needed for scoreboard recognition
-        board_detection = BoardDetection(board_detection_model_path=detection_model)
-        board_segmentation = BoardSegmentation(board_segmentation_model_path=segmentation_model)
+        board_detection = BoardDetection(board_detection_model_path=detection_model, gpu=gpu)
+        board_segmentation = BoardSegmentation(board_segmentation_model_path=segmentation_model, gpu=gpu)
         board_recognition = BoardRecognition(board_recognition_model_path=recognition_model)
         board_post_process = BoardPostProcess()
 
@@ -93,6 +96,9 @@ class Board:
     name_images = []
     frame_images = []
     total_images = []
+    name_final_images = []
+    frame_final_images = []
+    total_final_images = []
     segmented_rows = []
     segmented_lane = None
 
@@ -116,13 +122,46 @@ class Board:
 
     def __init__(self, id=0):
         self.id = id
+        self.image = None
+
+        # Scores
+        self.detection_prominence = 0
+        self.detection_confidence = 0
+        self.recognition_confidence = 0.0
+
+        # Image Segmentations
+        self.name_images = []
+        self.frame_images = []
+        self. total_images = []
+        self.name_final_images = []
+        self.frame_final_images = []
+        self.total_final_images = []
+        self.segmented_rows = []
+        self.segmented_lane = None
+
+        # Raw Recognized Data
+        self.recognition_rows = []
+        self.recognition_lane = ''
+
+        # Processed Meta Data
+        self.lane_number = ''
+        self.bowler_count = 0
+        self.active_bowler_index = -1
+        self.winner_bowler_index = -1
+        self.current_frame = 0
+        self.bowler_names = []
+        self.bowler_totals = []
+        self.bowler_frames = []
+
+        # Performance
+        self.times = {}
         
 
     def serialize(self):
         serialized_board = {}
         try:
             def serialize_structure(k, x):
-                if isinstance(x, list):
+                if isinstance(x, list) or isinstance(x, tuple):
                     return [serialize_structure(k, item) for item in x]
                 elif isinstance(x, dict):
                     return x
@@ -142,11 +181,8 @@ class Board:
                     serialized_board[attr] = serialize_structure(attr, getattr(self, attr))
 
         except Exception as e:
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            print(exc_type, fname, exc_tb.tb_lineno)
+            raise BoardSerializationError from e
         finally:
-
             return serialized_board
 
 
@@ -156,9 +192,10 @@ class Board:
 ##--------------------------------
 class BoardDetection:
 
-    def __init__(self, board_detection_model_path, board_class_id=0):
+    def __init__(self, board_detection_model_path, board_class_id=0, gpu=False):
         self.board_detection_model = YOLO(board_detection_model_path)
-        #self.board_detection_model.to('cuda')
+        if gpu:
+            self.board_detection_model.to('cuda')
         self.board_class_id = board_class_id
 
     def detect_boards(self, image):
@@ -228,9 +265,10 @@ class BoardDetection:
 ##--------------------------------
 class BoardSegmentation:
 
-    def __init__(self, board_segmentation_model_path):
+    def __init__(self, board_segmentation_model_path, gpu=False):
         self.board_segmentation_model = YOLO(board_segmentation_model_path)
-        #self.board_segmentation_model.to('cuda')
+        if gpu:
+            self.board_segmentation_model.to('cuda')
 
         self.CLASS_ACTIVE_ROW = 0
         self.CLASS_FRAME_COLUMN = 1
@@ -311,10 +349,10 @@ class BoardRecognition:
 
     def __init__(self, board_recognition_model_path):
         self.board_recognition_model = easyocr.Reader(["en"])
-        self.name_allow_list = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z']
-        self.frame_allow_list = ['0','1','2','3','4','5','6','7','8','9','x','/','-']
-        self.total_allow_list = ['0','1','2','3','4','5','6','7','8','9']
-        self.lane_allow_list = ['a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v','w','x','y','z','0','1','2','3','4','5','6','7','8','9']
+        self.name_allow_list = [char for char in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ']
+        self.frame_allow_list = [char for char in '0123456789Xx/-']
+        self.total_allow_list = [char for char in '0123456789']
+        self.lane_allow_list = [char for char in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789']
 
     def read_board(self, board):
 
@@ -322,6 +360,13 @@ class BoardRecognition:
         timer = u.start_timer()
 
         recognition_rows = []
+
+
+        board_image = np.copy(board.image)
+        board_image = u.denoise_image(board_image)
+        #board_image = u.color_quantization(board_image, k=4)
+        board_image = u.convert_grayscale(board_image)
+
 
         for segmented_row in board.segmented_rows:
             name_image = None
@@ -332,19 +377,31 @@ class BoardRecognition:
             frame_polygons = segmented_row[2]
             total_polygons = segmented_row[3]
 
+
+
+
+
             if len(name_polygons) > 0 and len(name_polygons[0]):
-                name_image = u.crop_image_by_polygon(board.image, name_polygons[0])
+                name_image = u.crop_image_by_polygon(board_image, name_polygons[0])
 
             if len(total_polygons) > 0 and len(total_polygons[0]):
-                total_image = u.crop_image_by_polygon(board.image, total_polygons[0])
+                total_image = u.crop_image_by_polygon(board_image, total_polygons[0])
 
             for frame_polygon in frame_polygons:
                 if len(frame_polygon):
-                    frame_images.append(u.crop_image_by_polygon(board.image, frame_polygon))
+                    frame_images.append(u.crop_image_by_polygon(board_image, frame_polygon))
 
-            name_text = self.read_roi(name_image, self.name_allow_list)
-            total_text = self.read_roi(total_image, self.total_allow_list)
-            frame_text = [self.read_roi(frame_image, self.frame_allow_list) for frame_image in frame_images]
+            board.name_images.append(name_image)
+            board.frame_images.append(frame_images)
+            board.total_images.append(total_image)
+
+            name_text, name_final_image = self.read_roi(name_image, self.name_allow_list)
+            total_text, total_final_image = self.read_roi(total_image, self.total_allow_list)
+            frame_text, frame_final_image = zip(*[self.read_roi(frame_image, self.frame_allow_list) for frame_image in frame_images])
+
+            board.name_final_images.append(name_final_image)
+            board.frame_final_images.append(frame_final_image)
+            board.total_final_images.append(total_final_image)
 
             recognition_rows.append([
                 name_text,
@@ -357,10 +414,10 @@ class BoardRecognition:
         lane_image = None
 
         if len(lane_polygon):
-            lane_image = u.crop_image_by_polygon(board.image, lane_polygon)
+            lane_image = u.crop_image_by_polygon(board_image, lane_polygon)
 
         if u.image_valid(lane_image):
-            lane_text = self.read_roi(lane_image, self.lane_allow_list)
+            lane_text, lane_final_image = self.read_roi(lane_image, self.lane_allow_list)
 
         board.recognition_rows = recognition_rows
         board.recognition_lane = lane_text
@@ -368,24 +425,82 @@ class BoardRecognition:
         board.times['recognition_inference'] = timer.stop()
 
     def read_roi(self, image, allow_list, text_threshold=0.5):
+
         text = ''
+        final_image = None
+        images_used = []
+
         if u.image_valid(image):
-            grayscale_image = u.convert_grayscale(image)
-            contrast_enhanced = u.enhance_image_contrast(grayscale_image)
-            flipped_image = u.invert_grayscale_if_more_black(contrast_enhanced)
-            borders_removed = u.remove_borders_from_image(flipped_image)
+            text_attempts = 5
+            acceptable_count = 3
+            text_found = []
 
-            if len(borders_removed.shape) == 2:
-                borders_removed = cv.cvtColor(borders_removed, cv.COLOR_GRAY2BGR)
+            for attempt in range(1, text_attempts):
+                attempt_image = self.random_process_sequence(np.copy(image))
 
-            if borders_removed.dtype != np.uint8:
-                borders_removed = borders_removed.astype(np.uint8)
+                text = self.text_recogntion(attempt_image, allow_list, text_threshold)
+                text = text.strip()
+                if text:
+                    text_found.append(text)
+                    images_used.append(attempt_image)
+                    if len(text_found) >= acceptable_count:
+                        break
 
-            if u.image_valid(borders_removed):
-                result = self.board_recognition_model.readtext(image=borders_removed, allowlist=allow_list, text_threshold=text_threshold)
+            if len(text_found) > 0:
+                text = max(text_found, key=len)
+                text_index = text_found.index(text)
+                final_image = images_used[text_index]
+
+        return text, final_image
+
+    def random_process_sequence(self, image):
+
+        method_count = 10
+        used_methods = []
+        process_count = random.randrange(0,method_count-1)
+        methods = [x for x in range(0, method_count-1)]
+
+        for process_index in range(0, process_count):
+            method_options = [method for method in methods if method not in used_methods]
+            if len(method_options):
+                method_index = random.choice(method_options)
+
+                if method_index == 0:
+                    image = u.adaptive_thresholding(image)
+                elif method_index == 1:
+                    image = u.invert_grayscale_if_more_black(image)
+                elif method_index == 2:
+                    image = u.boarder_removal(image)
+                elif method_index == 3:
+                    image = u.sharpen_image(image)
+                elif method_index == 4:
+                    image = u.single_color_mask(image)
+                elif method_index == 5:
+                    image = u.parent_contour_alteration(image)
+                elif method_index == 6:
+                    image = u.enhance_image_contrast(image)
+                elif method_index == 7:
+                    image = u.bilateral_filtration(image)
+                elif method_index == 8:
+                    image = u.remove_borders_from_image(image)
+                elif method_index == 9:
+                    image = u.add_margin_to_image(image, 15, (255))
+                used_methods.append(method_index)
+
+        return image
+
+    def text_recogntion(self, image, allow_list, text_threshold, easy_ocr=False):
+        text = ''
+
+        if u.image_valid(image):
+            if easy_ocr:
+                result = self.board_recognition_model.readtext(image=image, allowlist=allow_list, text_threshold=text_threshold)
                 text = u.get_easyocr_extracted_text(result)
-        return text
+            else:
+                whitelist = ''.join(allow_list)
+                text = pytesseract.image_to_string(image, config=f'--psm 12 -c tessedit_char_whitelist={whitelist}')
 
+        return text
 
 
 ##--------------------------------
@@ -520,6 +635,8 @@ class ImageInvalid(Exception):
 class BoardNotFound(Exception):
     pass
 class BoardDetectionError(Exception):
+    pass
+class BoardSerializationError(Exception):
     pass
 class BoardSegmentationError(Exception):
     pass
