@@ -37,7 +37,7 @@ def read_image():
             return
 
         if single_board:
-            board = board_reader.read_image(image)
+            board = board_reader.read_image(image, False)
             print(board.serialize)
             board = board.serialize()
             response['boards'] = [board]
