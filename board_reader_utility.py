@@ -1,13 +1,13 @@
-import json
-import math
 import os
 import time
-from difflib import SequenceMatcher
-
+import json
+import math
 import torch
 import base64
 import cv2 as cv
 import numpy as np
+from shapely import Polygon
+from difflib import SequenceMatcher
 from matplotlib import pyplot as plt
 
 
@@ -16,8 +16,6 @@ from matplotlib import pyplot as plt
 ##--------------------------------
 ## Colors
 ##--------------------------------
-from shapely import Polygon
-
 COLOR_BLACK = (0,0,0)
 COLOR_RED = (0,0, 255)
 COLOR_GREEN = (0,255, 0)
@@ -133,7 +131,6 @@ def crop_image_by_bounding_box(image, bounding_box):
     x, y, w, h = bounding_box
     return image[y:y+h, x:x+w]
 
-
 def crop_image_by_polygon(image, polygon):
 
     # Convert polygon to numpy array
@@ -239,12 +236,153 @@ def remove_borders_from_image(image, initial_margin=10, threshold=80):
 
         attempts += 1
 
+    if len(image.shape) == 2:
+        image = cv.cvtColor(image, cv.COLOR_GRAY2BGR)
+
+    if image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+
     return image
 
+def color_quantization(image, k=2, blur_value=5, color_weight=2.0):
+    blurred_image = cv.GaussianBlur(image, (blur_value, blur_value), 0)
+    data = blurred_image.reshape((-1, 3))
+    data = np.float32(data)
+
+    # Apply the weight to color channels
+    data *= [1, 1, color_weight]
+
+    criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    ret, label, center = cv.kmeans(data, k, None, criteria, 10, cv.KMEANS_RANDOM_CENTERS)
+    center = np.float32(center)  # Convert to float for division
+    center[:, :2] /= color_weight  # revert the scaling on the color channels
+    center = np.uint8(center)  # Convert back to uint8 after division
+    result = center[label.flatten()]
+    result_image = result.reshape((image.shape))
+
+    return result_image
+
+
+def sharpen_image(image):
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+
+    return cv.filter2D(image, -1, kernel)
+
+def denoise_image(image):
+    return cv.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+
+
+def single_color_mask(image):
+    # Calculate total number of pixels
+    total_pixels = image.shape[0] * image.shape[1]
+
+    # Initialize mask with zeros (black image)
+    mask = np.full_like(image, 255)
+
+    # Find unique colors and their counts
+    unique_colors, counts = np.unique(image.reshape(-1, image.shape[2]), axis=0, return_counts=True)
+
+    # Calculate percentages for each color
+    percentages = counts / total_pixels
+
+    # Mask colors that are no less than 5% and no greater than 50% of the total color
+    for color, percentage in zip(unique_colors, percentages):
+        if 0.1 <= percentage <= 0.30:
+            mask[np.all(image == color, axis=-1)] = color
+
+    return mask
+
+
+def boarder_removal(image, color_similarity_threshold=0.9):
+    h, w = image.shape[:2]
+
+    # Function to check each row or column
+    def check_line(line, reference_color, threshold):
+        return np.mean(line == reference_color) > threshold
+
+    # Initialize cut indices
+    top, bottom, left, right = 0, h, 0, w
+
+    # Check top edge
+    for i in range(h):
+        if not check_line(image[i, :], image[0, 0], color_similarity_threshold):
+            top = i
+            break
+
+    # Check bottom edge
+    for i in range(h - 1, -1, -1):
+        if not check_line(image[i, :], image[-1, 0], color_similarity_threshold):
+            bottom = i
+            break
+
+    # Check left edge
+    for i in range(w):
+        if not check_line(image[:, i], image[0, 0], color_similarity_threshold):
+            left = i
+            break
+
+    # Check right edge
+    for i in range(w - 1, -1, -1):
+        if not check_line(image[:, i], image[0, -1], color_similarity_threshold):
+            right = i
+            break
+
+    # Crop the image to remove borders
+    return image[top:bottom + 1, left:right + 1]
+
+
+def parent_contour_alteration(image):
+    gray = convert_grayscale(image)
+
+    # Threshold the image
+    ret, thresh = cv.threshold(gray, 127, 255, cv.THRESH_BINARY_INV)
+
+    # Find contours and hierarchy
+    contours, hierarchy = cv.findContours(thresh, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
+
+    # Create an empty mask for drawing
+    mask = np.zeros_like(gray)
+
+    # Check the hierarchy to draw contours
+    # hierarchy structure [Next, Previous, First_Child, Parent]
+    for idx, (contour, hier) in enumerate(zip(contours, hierarchy[0])):
+        if hier[2] < 0:  # If the contour has no child
+            cv.drawContours(mask, [contour], -1, (0), thickness=cv.FILLED)
+        else:  # If the contour has a child
+            cv.drawContours(mask, [contour], -1, (255), thickness=cv.FILLED)
+
+    return mask
+
+def adaptive_thresholding(image):
+
+    adaptive_thresholded = cv.threshold(image, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)[1]
+
+    return adaptive_thresholded
+
+
+def bilateral_filtration(image):
+    bilateral = cv.bilateralFilter(image, 9, 75, 75)
+
+    # Thresholding after filtering
+    _, thresh = cv.threshold(bilateral, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
+
+    # Define kernel for morphological operations
+    kernel = np.ones((2, 2), np.uint8)
+
+    # Apply morphological opening (erosion followed by dilation)
+    opening = cv.morphologyEx(thresh, cv.MORPH_OPEN, kernel, iterations=1)
+
+    return opening
+
 def enhance_image_contrast(image, threshold_min=0, threshold_max=255, clipLimit=2.0, tileGridSize=(8, 8)):
-    _, binary_image = cv.threshold(image, threshold_min, threshold_max, cv.THRESH_BINARY + cv.THRESH_OTSU)
-    clahe = cv.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
-    return clahe.apply(binary_image)
+    equalized_image = cv.equalizeHist(image)
+    #_, binary_image = cv.threshold(equalized_image, threshold_min, threshold_max, cv.THRESH_BINARY + cv.THRESH_OTSU)
+    #clahe = cv.createCLAHE(clipLimit=clipLimit, tileGridSize=tileGridSize)
+    #enhanced_contrast = clahe.apply(binary_image)
+    enhanced_contrast = equalized_image
+    return enhanced_contrast
 
 
 
